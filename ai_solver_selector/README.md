@@ -41,25 +41,45 @@ make
 
 What it does:
 
-- Walks a grid of `(mesh, refinement, order, problem_type, kappa, dt, aniso)`.
-- For each instance it assembles either a steady Poisson system (`-Δ u = f`,
-  `problem_type=0`) or a transient implicit step `T = M + dt*K` from ex16
-  (`problem_type=1`).
-- Extracts 17 features (size, nnz, density, diagonal-dominance, symmetry
-  defect, condition proxy, problem metadata, etc.).
+- Walks a grid of `(mesh, refinement, order, problem_type, kappa, dt, aniso,
+  reaction, velocity)`.
+- For each instance it assembles **one of five** heat-physics linear systems:
+
+  | `problem_type` | System | Symmetric? | Notes |
+  | --- | --- | --- | --- |
+  | 0 | Steady Poisson  `-∇·(κ∇u) = f` (ex1-style) | yes | SPD |
+  | 1 | Transient implicit step  `(M + dt·K) u = f` (ex16-style) | yes | SPD; varies dt |
+  | 2 | Pure mass solve  `M u = f` | yes | SPD, well-conditioned |
+  | 3 | Reaction-diffusion  `(K + r·M) u = f` | yes | SPD; varies r |
+  | 4 | Convection-diffusion  `(K + β·∇) u = f` | **no** | CG diverges; GMRES/BiCGStab matter |
+
+- Extracts **22 features** (matrix size, nnz, density, average bandwidth,
+  diagonal-dominance, symmetry defect, condition proxy, trace, max-abs,
+  Frobenius norm, plus problem metadata: dim, order, ref-levels, kappa,
+  alpha, dt, aniso, reaction, velocity).
 - Times **6 solver+preconditioner pairs** on the same matrix:
   CG+Jacobi, CG+GS, GMRES+Jacobi, GMRES+GS, BiCGStab+Jacobi, MINRES+Jacobi.
 - Writes one CSV row per problem.
 
 Useful flags:
 
-- `-n N` randomly sub-sample N configurations from the full grid (faster
-  iteration during development).
-- `-rp K` average each solver over K runs (reduces timing jitter).
-- `-mi`/`-rt` change the solver's `max_iter` / relative tolerance.
+| Flag | Meaning |
+| --- | --- |
+| `-pt 0,3,4` | Restrict to the listed problem types. |
+| `-n N` | Randomly sub-sample N configurations from the full grid. |
+| `-rp K` | Average each solver over K runs (reduces timing jitter). |
+| `-w / -no-w` | Toggle the untimed warm-up solve (default on). |
+| `-q` | Use a much smaller grid for fast iteration. |
+| `-a` | Append to an existing CSV instead of overwriting it. |
+| `-mx N` | Skip configurations whose DOF count exceeds `N`. |
+| `-mi` / `-rt` | Change `max_iter` / relative tolerance. |
+
+The full grid produces several thousand configurations; use `-n` and
+`-mx` to keep wall-clock time manageable, or `-q` for a quick sanity run.
 
 The solver list lives in `solver_registry.hpp`; append-only, so existing
-trained models stay valid.
+trained models stay valid. Older CSVs (with fewer feature columns) are
+still trainable - missing columns are filled with zeros.
 
 ## 2. Train
 

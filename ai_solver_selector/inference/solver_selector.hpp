@@ -87,11 +87,15 @@ private:
 // Build the feature vector for a problem instance the same way
 // collect_heat_data does at training time. Pass the scalar parameters that
 // describe the problem (problem_type, dim, order, ref_levels, kappa, alpha,
-// dt, aniso) and the assembled, post-elimination SparseMatrix.
+// dt, aniso, reaction, velocity) and the assembled, post-elimination
+// SparseMatrix. The reaction/velocity arguments default to 0 so existing
+// callers keep working unchanged.
 inline FeatureVector ExtractFeatures(int problem_type, int dim, int order,
                                      int ref_levels, double kappa,
                                      double alpha, double dt, double aniso,
-                                     const mfem::SparseMatrix &A)
+                                     const mfem::SparseMatrix &A,
+                                     double reaction = 0.0,
+                                     double velocity = 0.0)
 {
    FeatureVector f;
    f.fill(0.0);
@@ -103,6 +107,8 @@ inline FeatureVector ExtractFeatures(int problem_type, int dim, int order,
    f[F_ALPHA] = alpha;
    f[F_DT] = dt;
    f[F_ANISO] = aniso;
+   f[F_REACTION] = reaction;
+   f[F_VELOCITY] = velocity;
    FillMatrixFeatures(A, f);
    return f;
 }

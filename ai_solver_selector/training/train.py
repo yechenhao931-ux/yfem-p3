@@ -35,6 +35,7 @@ FEATURE_COLUMNS = [
     "nnz", "avg_nnz", "max_nnz", "density", "diag_dom",
     "symmetry", "frob_norm", "cond_est", "kappa",
     "alpha", "dt", "aniso",
+    "bandwidth", "trace", "max_abs", "reaction", "velocity",
 ]
 SOLVER_NAMES = [
     "CG+Jacobi", "CG+GS", "GMRES+Jacobi",
@@ -47,15 +48,22 @@ def load_dataset(csv_path: Path) -> tuple[torch.Tensor, torch.Tensor]:
     times: list[list[float]] = []
     with csv_path.open() as f:
         reader = csv.DictReader(f)
-        time_cols = [c for c in reader.fieldnames or [] if c.startswith("t_solver_")]
+        fields = reader.fieldnames or []
+        time_cols = [c for c in fields if c.startswith("t_solver_")]
         if len(time_cols) != len(SOLVER_NAMES):
             raise ValueError(
                 f"CSV has {len(time_cols)} solver columns, expected "
                 f"{len(SOLVER_NAMES)}"
             )
+        missing = [c for c in FEATURE_COLUMNS if c not in fields]
+        if missing:
+            print(
+                f"NOTE: CSV is missing feature columns {missing}; "
+                "they will be filled with 0.0 (older collector output)."
+            )
         for row in reader:
             try:
-                feats.append([float(row[c]) for c in FEATURE_COLUMNS])
+                feats.append([float(row.get(c, 0.0) or 0.0) for c in FEATURE_COLUMNS])
                 times.append([float(row[c]) for c in time_cols])
             except (ValueError, KeyError):
                 continue
