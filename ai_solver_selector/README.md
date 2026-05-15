@@ -88,21 +88,102 @@ cd <repo root>
 pip install -r ai_solver_selector/training/requirements.txt
 python -m ai_solver_selector.training.train \
     --csv data/heat_solver_dataset.csv \
-    --out ai_solver_selector/inference/solver_selector.ts
+    --out ai_solver_selector/inference/solver_selector.ts \
+    --model moe --loss regret \
+    --metrics-out reports/heat_solver_run.json
 ```
 
 The trainer:
 
-- Splits 85/15 train/val.
-- Standardises the features and predicts `log(time)` per solver (runtimes
-  span orders of magnitude, so log-space is much better behaved).
-- Reports validation loss, top-1 best-solver accuracy, and the average
-  *fractional* slowdown of the AI's pick vs. the ground-truth optimum
-  (`mean_overhead` 0.05 = picks are ~5% slower on average).
-- Saves a TorchScript module (`torch.jit.script`) so C++ can load it without
-  Python.
+- **Group-aware split**: train/validation rows from the same
+  `(dim, ref_levels, order, n)` group never mix. This prevents the
+  model from memorising specific mesh+order combinations and reflects
+  real deployment, where a new user problem is unseen at training time.
+  `--no-group-split` reverts to the leaky variant for comparison.
+- **Predicts `log(time)` per solver**, then picks `argmin` at inference.
+  Log-space avoids the regression collapsing onto the largest examples
+  (runtimes span 4+ orders of magnitude).
+- **Cosine LR schedule with warmup**, AdamW + grad-clipping.
+- **Early stopping** on validation mean-regret.
+- **Reports**: top-1 / top-3 argmin accuracy, mean / median / p95
+  *relative regret* (`(t_picked - t_optimum) / t_optimum`), and the
+  same metrics broken down per `problem_type`.
+- **Baseline comparison on the same split**: oracle, always-X (one row
+  per solver), ridge regression in log-time space, 1-NN.
+- Optionally dumps a JSON report (`--metrics-out`) ready to be cited in
+  a thesis "Experiments" section.
+- Saves a TorchScript module so C++ can load it without Python.
 
-Tune `--epochs`, `--hidden`, `--depth`, `--lr` if you need to.
+### Method overview (thesis Section X.Y material)
+
+| Component | Choice | Rationale |
+| --- | --- | --- |
+| Architecture | MLP (`--model mlp`) **or** mixture-of-experts (`--model moe`) | MoE has one head per `problem_type`; the shared trunk learns generic matrix->time relations, heads specialise (e.g. CG vs. GMRES regime). |
+| Output target | `log(time)` per solver | Log-space stabilises optimisation when runtimes span orders of magnitude. |
+| Loss | Smooth-L1 regression *or* **soft-regret** *or* **ListMLE** (`--loss`) | Regression optimises fit; regret optimises decision quality; listwise optimises ordering. The thesis ablates all three on the same data. |
+| Regularisation | Dropout in every hidden block, weight-decay, gradient clipping | Dropout doubles as a Monte Carlo posterior at inference for uncertainty estimates. |
+| Schedule | Linear warmup -> cosine decay | Standard recipe; stable for small datasets. |
+| Selection criterion | **Validation mean regret**, not validation loss | Loss is a proxy; regret is the deployment objective. |
+| Evaluation | Top-1, Top-3 argmin accuracy, mean / median / p95 regret, per-type breakdown, confusion matrix | Top-k tells you whether the model's ranking is roughly right; regret tells you the actual wall-clock cost in seconds; the breakdown shows where the gain comes from. |
+| Baselines | Oracle, always-X (six policies), ridge regression, 1-NN | Standard suite in autotuning literature. The neural model has to clear all of them. |
+
+### Soft-regret loss
+
+The classical regression objective treats every (problem, solver) pair
+equally; a 10% error on a slow GMRES run gets the same gradient
+magnitude as a 10% error on the optimal CG run. For solver selection
+only the *argmin* matters, so we minimise *expected relative regret*:
+
+```
+y_hat_i = log-time predicted for solver i
+w       = softmax(-y_hat / tau)             # soft argmin, differentiable
+loss    = E_w[ t_actual ] / min_i t_actual_i - 1
+```
+
+As `tau -> 0` the soft argmin becomes the true argmin and the loss
+becomes the deterministic regret. At moderate `tau` (default 0.1)
+every solver receives gradient signal, which is necessary for stable
+training. Set with `--loss regret --regret-tau 0.1`.
+
+### Group-aware splitting
+
+Naive row-shuffled splits leak: the same `(mesh, ref_levels, order)`
+configuration appears in train and validation with only `kappa` / `dt`
+varying. The model memorises the lookup and reports >95% accuracy that
+collapses in production. We split groups, not rows, where a group is
+the discrete tuple `(dim, ref_levels, order, n)`. The thesis quantifies
+the leakage by training both ways and reporting the gap.
+
+### Monte Carlo dropout uncertainty
+
+Dropout stays enabled at inference for `--mc-samples N` stochastic
+forward passes. The per-solver mean is the prediction, the per-solver
+standard deviation is an epistemic-uncertainty estimate. The C++
+inference module exposes `PredictBestSolverSafe(...)`, which falls
+back to a safe default (CG+Jacobi) when uncertainty exceeds a
+configurable threshold - the deployment-safety story for the thesis.
+
+### Ablation studies
+
+```bash
+python -m ai_solver_selector.training.ablation \
+    --csv data/heat_solver_dataset.csv \
+    --out reports/ablation.csv
+```
+
+Re-trains the model with each feature group masked out and reports the
+mean-regret delta vs. the full feature set. The current grouping
+follows the matrix-features header:
+
+| Group | Features | What it captures |
+| --- | --- | --- |
+| `problem_meta` | `problem_type, dim, order, ref_levels` | which PDE we are solving |
+| `scale` | `n, nnz, avg_nnz, max_nnz, density` | how big and sparse the matrix is |
+| `spectral_proxy` | `diag_dom, cond_est, frob_norm, max_abs, trace` | cheap conditioning surrogates |
+| `structure` | `symmetry, bandwidth` | symmetry and locality |
+| `physics` | `kappa, alpha, dt, aniso, reaction, velocity` | PDE coefficient regime |
+
+The thesis can cite the resulting table directly.
 
 ## 3. Serve from C++
 
