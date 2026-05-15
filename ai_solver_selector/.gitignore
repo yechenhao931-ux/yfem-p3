@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# TorchScript artifacts and metrics dumps are training outputs, not source.
+*.ts
+*.pt
