@@ -7,10 +7,17 @@
 # ------------------------------------------------------------------------------
 
 # Object and library files
+*.out
+*.exe
+*.csv
 *.o
 *.o.tmp
+*.out
 /libmfem.*
 /miniapps/common/libmfem-common.*
+
+#python-env
+.venv/
 
 # CMake generated files
 CMakeCache.txt

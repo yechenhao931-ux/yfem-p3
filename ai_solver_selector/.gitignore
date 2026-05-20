@@ -1,7 +1,9 @@
 __pycache__/
 *.pyc
 *.pyo
-
+ai_collect_heat_data
+heat_demo
+torch_training/models/
 # TorchScript artifacts and metrics dumps are training outputs, not source.
 *.ts
 *.pt
