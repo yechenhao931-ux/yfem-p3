@@ -1,10 +1,15 @@
 # AI Solver Selector — v3 修改文档
 
-本次升级聚焦两点：
+本次升级聚焦四点：
 1. **真实网格数据源**：不再仅依赖 `Mesh::MakeCartesian2D/3D` 生成的规则方/三/六/四面体网格，
    而是支持直接读取 `mfem/data/*.mesh` 中的复杂几何（L 型、星形、Fichera、Beam、混合单元等）。
 2. **扩展求解器集合**：从原本的 8 种 (CG/PCG_*/MINRES/MINRES_Jac/GMRES/GMRES_*)
    扩展到 14 种 Krylov 求解器 + 直接法。新增 FGMRES、BiCGSTAB 家族和 `PCG_l1Jac`。
+3. **大规模训练数据**（v3.1 增量）：
+   - 重新启用对流-扩散并新增 3 种物理（反应-扩散、各向异性+多材料、对流+各向异性）
+   - `--orders 1,2,3` 一次跑多个有限元阶
+   - `--dense` 模式将每个物理参数 sweep 的取样数量大约翻倍
+   - `--jitter 0.1 --jitter-copies 2` 对每个真实网格生成节点抖动副本，从同一拓扑产出多个矩阵
 
 ---
 
@@ -287,3 +292,131 @@ make
 > 用 `mfem/data/*.mesh` 中的真实几何替代/补充原本的 Cartesian 立方体，
 > 并把求解器集合从 8 扩到 15（加 FGMRES、BiCGSTAB、l1-Jacobi）；
 > CSV / 训练 / 推理三处接口都已对齐，老模型保持向前兼容（仅缺新类别）。
+
+---
+
+# v3.1 增量：大规模训练数据
+
+## 9. 新增物理问题（默认全部开启）
+
+| 编号 | 名称 | 系统 | 对称？ | 主要训练价值 |
+| --- | --- | --- | --- | --- |
+| 4 | `ConvDiff_Pe*` | `(-∇·(k∇u) + β·∇u) = f` | 否 | 让 GMRES/BiCGSTAB/FGMRES 真正出现差异 |
+| 8 | `ReactDiff_r*` | `(K + r·M) u = f` | SPD | r 控制对角偏移，覆盖 K-主导→M-主导 全谱 |
+| 9 | `AnisoMat_*` | 各向异性张量 + 高对比夹杂物 | SPD | 极端条件数下不同前提条件子的差异 |
+| 10 | `ConvAniso_Pe*_k*` | 对流 + 各向异性扩散 | 否 | 同时非对称 + 各向异性，多 stress test |
+
+第 4 项之前被注释掉（生成的矩阵非对称且 CG 会发散），现在已重新启用。其余三项为本次新增。
+
+## 10. 多 polynomial order 一次跑
+
+```bash
+# 同一 mesh × ref 上一次跑 P1, P2, P3
+./ai_collect_heat_data --orders 1,2,3 ...
+```
+
+CSV 的 `poly_order` 列已支持，训练侧无需改动。注意 P2/P3 的 DOF 和组装时间显著增长，
+配合 `--max-dof` 与 `--mesh-max-ref` 使用。
+
+## 11. `--dense` 模式 — 物理参数翻倍
+
+每种物理的 sweep 大致翻一倍：
+
+| 物理 | 默认采样数 | dense 采样数 |
+| --- | --- | --- |
+| Steady k | 5 | 11 (0.1→1000) |
+| Aniso | 5 | 10 |
+| MultiMat | 6 | 11 (2→1e8) |
+| ConvDiff Pe | 3 | 8 |
+| Robin h | 7 | 11 |
+| Transient dt | 5 | 8 (1e-6→10) |
+| Nonlinear α | 6 | 10 |
+| ReactDiff r | 6 | 11 |
+| AnisoMat | 3 | 8 |
+| ConvAniso | 3 | 9 |
+
+dense 模式下，每个 (mesh, ref, order, copy) 组合大约产生 96 个物理 cases；
+按 14 个求解器 × ~100 (mesh, ref) 组合 × 多个 order 估算，
+总样本量可达 **十万级 row**。
+
+## 12. 节点抖动数据增强 (`--jitter`)
+
+对每个**真实网格**（不影响合成 Cartesian）：
+- 加载后从内部顶点 (非 boundary 顶点) 上施加 `±strength · h_avg` 的均匀随机扰动
+- `h_avg` 是前 50 个单元的平均特征尺寸
+- boundary 顶点保持不动 → 几何形状不破坏
+- `--jitter-copies N` 给每个 mesh × ref 多生成 N 个抖动副本
+
+效果：同一拓扑生成多个不同矩阵（节点坐标变化 → DiffusionIntegrator 的元素矩阵变化），
+显著增加训练样本多样性而不需要更多 `.mesh` 文件。
+
+```bash
+./ai_collect_heat_data \
+    --mesh-dir /home/user/yfem-p3/data \
+    --jitter 0.15 \
+    --jitter-copies 3 \
+    --output heat_results_jittered.csv
+```
+
+每个真实网格 ref 产出 1 + 3 = 4 个 mesh 样本（原始 + 3 抖动副本），数据量直接 4 倍。
+
+## 13. 新 CLI flag 汇总
+
+| Flag | 含义 | 默认 |
+| --- | --- | --- |
+| `--orders 1,2,3` | 多个有限元阶 (逗号分隔)；与 `--order N` 等价但更通用 | `--orders 1` |
+| `--dense` | 物理参数 sweep 取样数翻倍 | 关 |
+| `--no-convdiff` | 关闭对流-扩散物理 | 开 |
+| `--no-reaction` | 关闭反应-扩散物理 | 开 |
+| `--no-aniso-mat` | 关闭复合 各向异性+多材料 | 开 |
+| `--no-conv-aniso` | 关闭复合 对流+各向异性 | 开 |
+| `--jitter <s>` | 节点抖动强度 (相对 h_avg)；`0` = 关 | 0 |
+| `--jitter-copies <n>` | 每个真实网格 × ref 的抖动副本数 | 0 |
+| `--jitter-seed <n>` | 抖动 RNG 种子 | 1234 |
+
+## 14. 推荐数据采集套餐
+
+```bash
+# A) 中等规模 (~5-10 万 rows)
+./ai_collect_heat_data \
+    --mesh-dir /home/user/yfem-p3/data \
+    --mesh-max-ref 3 \
+    --max-dof 200000 \
+    --max-ref 5 --max-ref-3d 3 \
+    --orders 1,2 \
+    --timeout 60 \
+    --output heat_results_v31_medium.csv \
+    --output-best heat_best_v31_medium.csv
+
+# B) 大规模 + 抖动 (~20-50 万 rows)
+./ai_collect_heat_data \
+    --mesh-dir /home/user/yfem-p3/data \
+    --mesh-max-ref 3 \
+    --max-dof 300000 \
+    --max-ref 5 --max-ref-3d 3 \
+    --orders 1,2 \
+    --dense \
+    --jitter 0.1 --jitter-copies 2 \
+    --timeout 90 \
+    --output heat_results_v31_large.csv \
+    --output-best heat_best_v31_large.csv
+
+# C) 快速冒烟 (~1-5 千 rows)
+./ai_collect_heat_data \
+    --mesh-dir /home/user/yfem-p3/data \
+    --mesh-limit 10 \
+    --mesh-max-ref 2 \
+    --max-ref 3 --max-ref-3d 2 \
+    --no-conv-aniso --no-aniso-mat \
+    --max-dof 50000 \
+    --output heat_smoke.csv
+```
+
+## 15. 训练侧依旧无需改动
+
+- 新物理家族 `ReactDiff` / `AnisoMat` / `ConvAniso` / `ConvDiff` 都按 `problem_family` 自动 one-hot；
+- 新求解器名（已在 v3 加入）继续由 `LabelEncoder` 自动收纳；
+- 抖动副本在 CSV 里看不出来——只是更多 (DOF, nnz, cond) 上略有差异的样本。
+
+如果开启 `--orders 1,2`，CSV 的 `poly_order` 列会同时出现 1 和 2，
+`engineer_features` 的 `is_high_order` 派生特征会自动反映。

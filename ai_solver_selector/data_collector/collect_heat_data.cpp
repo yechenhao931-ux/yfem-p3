@@ -79,27 +79,38 @@ using namespace mfem;
 //  配置
 // =====================================================================
 struct Config {
-    int         min_ref_2d    = 1;
-    int         max_ref_2d    = 6;
-    int         min_ref_3d    = 1;
-    int         max_ref_3d    = 4;
-    int         order         = 1;
-    double      rtol          = 1e-8;
-    double      atol          = 1e-14;
-    int         max_iter      = 5000;
-    int         gmres_kdim    = 30;
+    int              min_ref_2d    = 1;
+    int              max_ref_2d    = 6;
+    int              min_ref_3d    = 1;
+    int              max_ref_3d    = 4;
+    std::vector<int> orders        = {1};  // 多个有限元阶；CSV 一条 row/order
+    double           rtol          = 1e-8;
+    double           atol          = 1e-14;
+    int              max_iter      = 5000;
+    int              gmres_kdim    = 30;
 
     // 过滤开关
     bool run_steady     = true;
     bool run_aniso      = true;
     bool run_multi_mat  = true;
-    bool run_convdiff   = true;
+    bool run_convdiff   = true;   // 现在默认开（非对称矩阵，让 GMRES/BiCGSTAB 有用武之地）
     bool run_robin      = true;
     bool run_transient  = true;
     bool run_nonlinear  = true;
+    bool run_react_diff = true;   // 新增：反应-扩散 (K + r·M) u = f
+    bool run_aniso_mat  = true;   // 新增：复合 各向异性 + 多材料
+    bool run_conv_aniso = true;   // 新增：复合 对流 + 各向异性 (强非对称)
 
     bool run_2d = true;
     bool run_3d = true;
+
+    // ── 大量参数扫描开关 ────────────────────────────────────
+    bool dense = false;           // --dense：物理参数 sweep 翻倍 (默认关，避免数据爆炸)
+
+    // ── 真实网格节点抖动（数据增强）─────────────────────────
+    double jitter_strength = 0.0; // ∈ [0, ~0.3]，相对元素特征尺寸；0 = 不抖动
+    int    jitter_copies   = 0;   // 每个真实网格产生的额外抖动副本数
+    int    jitter_seed     = 1234;
 
     // 网格类型开关（用于排查崩溃）
     bool run_quad = true;
@@ -138,7 +149,19 @@ Config ParseArgs(int argc, char** argv) {
         if      (a == "--max-ref"    && i+1<argc) c.max_ref_2d = std::stoi(argv[++i]);
         else if (a == "--max-ref-3d" && i+1<argc) c.max_ref_3d = std::stoi(argv[++i]);
         else if (a == "--min-ref"    && i+1<argc) c.min_ref_2d = std::stoi(argv[++i]);
-        else if (a == "--order"      && i+1<argc) c.order      = std::stoi(argv[++i]);
+        else if (a == "--order"      && i+1<argc) {
+            c.orders = { std::stoi(argv[++i]) };
+        }
+        else if (a == "--orders"     && i+1<argc) {
+            // 形如 "1,2,3"
+            c.orders.clear();
+            std::stringstream ss(argv[++i]);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                if (!tok.empty()) c.orders.push_back(std::stoi(tok));
+            }
+            if (c.orders.empty()) c.orders.push_back(1);
+        }
         else if (a == "--rtol"       && i+1<argc) c.rtol       = std::stod(argv[++i]);
         else if (a == "--max-iter"   && i+1<argc) c.max_iter   = std::stoi(argv[++i]);
         else if (a == "--timeout"    && i+1<argc) c.solver_timeout_s = std::stod(argv[++i]);
@@ -181,6 +204,16 @@ Config ParseArgs(int argc, char** argv) {
         else if (a == "--mesh-seed"     && i+1<argc) c.mesh_dir_seed    = std::stoi(argv[++i]);
         else if (a == "--no-synthetic") c.no_synthetic = true;
         else if (a == "--max-dof"       && i+1<argc) c.max_dof          = std::stoi(argv[++i]);
+        // 新增：扩大参数 sweep / 复合物理
+        else if (a == "--dense")        c.dense = true;
+        else if (a == "--no-convdiff")  c.run_convdiff   = false;
+        else if (a == "--no-reaction")  c.run_react_diff = false;
+        else if (a == "--no-aniso-mat") c.run_aniso_mat  = false;
+        else if (a == "--no-conv-aniso")c.run_conv_aniso = false;
+        // 新增：节点抖动数据增强
+        else if (a == "--jitter"        && i+1<argc) c.jitter_strength = std::stod(argv[++i]);
+        else if (a == "--jitter-copies" && i+1<argc) c.jitter_copies   = std::stoi(argv[++i]);
+        else if (a == "--jitter-seed"   && i+1<argc) c.jitter_seed     = std::stoi(argv[++i]);
     }
     return c;
 }
@@ -800,6 +833,153 @@ AssembledSystem BuildNonlinearStep(Mesh& mesh, FiniteElementSpace& fes,
     return sys;
 }
 
+// ── 8. 反应-扩散  (K + r·M) u = f  ─────────────────────────
+// r 控制 mass term 的权重；大 r → 系统接近 mass-only (对角占优)
+//                            小 r → 系统接近纯 Poisson
+// 与瞬态 BE 同形，但语义上是不同问题族，分开记录有助于训练
+AssembledSystem BuildReactionDiffusion(Mesh& mesh, FiniteElementSpace& fes,
+                                        double reaction, HeatResult& r)
+{
+    AssembledSystem sys;
+    auto t0 = Clock::now();
+
+    sys.form.reset(new BilinearForm(&fes));
+    sys.k_coef.reset(new ConstantCoefficient(1.0));
+    sys.form->AddDomainIntegrator(new DiffusionIntegrator(*sys.k_coef));
+
+    sys.inv_dt_coef.reset(new ConstantCoefficient(reaction));
+    sys.form->AddDomainIntegrator(new MassIntegrator(*sys.inv_dt_coef));
+
+    sys.lf.reset(new LinearForm(&fes));
+    sys.src_coef.reset(new ConstantCoefficient(1.0));
+    sys.lf->AddDomainIntegrator(new DomainLFIntegrator(*sys.src_coef));
+
+    sys.gf.reset(new GridFunction(&fes));
+    AssembleAndFormSystem(*sys.form, *sys.lf, fes, mesh,
+                          sys.A, sys.X, sys.B, *sys.gf);
+    sys.assemble_ms = since(t0);
+
+    r.k_ratio = 1.0; r.peclet = 0.0; r.material_contrast = reaction;
+    return sys;
+}
+
+// ── 9. 复合：各向异性 + 多材料  ─────────────────────────────
+// 在 inclusion 区域使用各向异性系数，在背景使用各向同性，对训练 stress test
+AssembledSystem BuildAnisoMultiMat(Mesh& mesh, FiniteElementSpace& fes,
+                                     double kx, double ky, double kz,
+                                     double contrast, HeatResult& r)
+{
+    AssembledSystem sys;
+    auto t0 = Clock::now();
+
+    int dim = mesh.Dimension();
+    Vector center(dim); center = 0.5;
+    double radius = 0.25;
+
+    sys.form.reset(new BilinearForm(&fes));
+    // 各向异性张量
+    sys.K_coef.reset(new AnisoK(dim, kx, ky, kz));
+    sys.form->AddDomainIntegrator(new DiffusionIntegrator(*sys.K_coef));
+    // 在 inclusion 内额外加一份各向同性系数 (contrast - 1) 作为"夹杂"
+    sys.k_coef.reset(new HeterogeneousK(0.0, contrast - 1.0, center, radius));
+    sys.form->AddDomainIntegrator(new DiffusionIntegrator(*sys.k_coef));
+
+    sys.lf.reset(new LinearForm(&fes));
+    sys.src_coef.reset(new ConstantCoefficient(1.0));
+    sys.lf->AddDomainIntegrator(new DomainLFIntegrator(*sys.src_coef));
+
+    sys.gf.reset(new GridFunction(&fes));
+    AssembleAndFormSystem(*sys.form, *sys.lf, fes, mesh,
+                          sys.A, sys.X, sys.B, *sys.gf);
+    sys.assemble_ms = since(t0);
+
+    double kmax = std::max({kx, ky, kz, contrast});
+    double kmin = std::min({kx, ky, kz, 1.0});
+    r.k_ratio = kmax / std::max(kmin, 1e-30);
+    r.peclet = 0.0;
+    r.material_contrast = contrast;
+    return sys;
+}
+
+// ── 10. 复合：对流 + 各向异性  ────────────────────────────────
+// 强非对称 (对流) + 强各向异性 → 测试 GMRES/FGMRES/BiCGSTAB 差异
+AssembledSystem BuildConvAniso(Mesh& mesh, FiniteElementSpace& fes,
+                                double peclet, double k_ratio,
+                                HeatResult& r)
+{
+    AssembledSystem sys;
+    auto t0 = Clock::now();
+
+    int dim = mesh.Dimension();
+    double h = mesh.GetElementSize(0);
+    if (h < 1e-12) h = 1e-3;
+    double v_mag = 1.0;
+    double k_iso = v_mag * h / (2.0 * std::max(peclet, 0.01));
+
+    sys.form.reset(new BilinearForm(&fes));
+    // 各向异性扩散（k_ratio 控制 x/y 方向比）
+    sys.K_coef.reset(new AnisoK(dim, k_iso * k_ratio, k_iso, k_iso));
+    sys.form->AddDomainIntegrator(new DiffusionIntegrator(*sys.K_coef));
+
+    Vector vvec(dim); vvec = 0.0; vvec(0) = v_mag;
+    if (dim > 1) vvec(1) = 0.5 * v_mag;
+    sys.v_coef.reset(new VectorConstantCoefficient(vvec));
+    sys.form->AddDomainIntegrator(new ConvectionIntegrator(*sys.v_coef, 1.0));
+
+    sys.lf.reset(new LinearForm(&fes));
+    sys.src_coef.reset(new ConstantCoefficient(1.0));
+    sys.lf->AddDomainIntegrator(new DomainLFIntegrator(*sys.src_coef));
+
+    sys.gf.reset(new GridFunction(&fes));
+    AssembleAndFormSystem(*sys.form, *sys.lf, fes, mesh,
+                          sys.A, sys.X, sys.B, *sys.gf);
+    sys.assemble_ms = since(t0);
+
+    r.k_ratio = k_ratio; r.peclet = peclet; r.material_contrast = 1.0;
+    return sys;
+}
+
+// ── 节点抖动（数据增强）──────────────────────────────────────
+// 对 (内部) 顶点位置加上 ε·U[-1,1] 的随机扰动；边界点保持不动以维持几何。
+// 真实 mesh 上做抖动可以从同一拓扑生成多个不同的矩阵。
+void JitterMesh(Mesh& m, double strength, unsigned seed)
+{
+    if (strength <= 0.0 || m.GetNV() == 0) return;
+    // 抖动幅度按平均元素特征尺寸缩放
+    double h_avg = 0.0;
+    int    nh    = 0;
+    for (int i = 0; i < m.GetNE() && i < 50; ++i) {
+        double h = m.GetElementSize(i);
+        if (std::isfinite(h) && h > 0) { h_avg += h; ++nh; }
+    }
+    if (nh == 0) return;
+    h_avg /= nh;
+    double amp = strength * h_avg;
+
+    // 找内部节点：bdr 顶点保持不动
+    int N = m.GetNV();
+    std::vector<bool> on_bdr(N, false);
+    for (int be = 0; be < m.GetNBE(); ++be) {
+        Array<int> v;
+        m.GetBdrElementVertices(be, v);
+        for (int k = 0; k < v.Size(); ++k) on_bdr[v[k]] = true;
+    }
+
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> U(-1.0, 1.0);
+
+    int sdim = m.SpaceDimension();
+    // 真实网格加载后未 EnsureNodes()：顶点直接存在 vertex 数组里，
+    // 直接修改 GetVertex 是安全的。
+    for (int i = 0; i < N; ++i) {
+        if (on_bdr[i]) continue;
+        real_t* x = m.GetVertex(i);
+        for (int d = 0; d < sdim; ++d) {
+            x[d] += static_cast<real_t>(amp * U(rng));
+        }
+    }
+}
+
 // =====================================================================
 //  跑一个物理问题 × 求解器列表
 // =====================================================================
@@ -1097,15 +1277,31 @@ int main(int argc, char** argv)
     Config cfg = ParseArgs(argc, argv);
 
     std::printf("\n\033[1m╔══════════════════════════════════════════════════════════════╗\n"
-                  "║       MFEM 热传导问题 — 最优求解器数据收集 (v2)              ║\n"
+                  "║       MFEM 热传导问题 — 最优求解器数据收集 (v3)              ║\n"
                   "╚══════════════════════════════════════════════════════════════╝\033[0m\n");
-    std::printf("  FEM 阶数  : P%d\n", cfg.order);
+    {
+        std::string ords;
+        for (size_t i = 0; i < cfg.orders.size(); ++i) {
+            if (i) ords += ",";
+            ords += "P" + std::to_string(cfg.orders[i]);
+        }
+        std::printf("  FEM 阶数  : %s\n", ords.c_str());
+    }
     std::printf("  收敛容差  : %.0e (rel) / %.0e (abs)\n", cfg.rtol, cfg.atol);
     std::printf("  最大迭代  : %d\n", cfg.max_iter);
     std::printf("  超时      : %.1f s\n", cfg.solver_timeout_s);
     std::printf("  直接法上限: %d DOF\n", cfg.direct_max_dof);
     if (cfg.max_dof > 0)
         std::printf("  max_dof   : %d (超过则跳过该 case)\n", cfg.max_dof);
+    std::printf("  物理覆盖  : steady%s aniso%s multimat%s convdiff%s robin%s "
+                "transient%s nonlinear%s reaction%s aniso-mat%s conv-aniso%s\n",
+                cfg.run_steady?"✓":"✗", cfg.run_aniso?"✓":"✗",
+                cfg.run_multi_mat?"✓":"✗", cfg.run_convdiff?"✓":"✗",
+                cfg.run_robin?"✓":"✗", cfg.run_transient?"✓":"✗",
+                cfg.run_nonlinear?"✓":"✗", cfg.run_react_diff?"✓":"✗",
+                cfg.run_aniso_mat?"✓":"✗", cfg.run_conv_aniso?"✓":"✗");
+    if (cfg.dense)
+        std::printf("  采样模式  : \033[33mdense\033[0m (物理参数 sweep 已扩展)\n");
     if (!cfg.mesh_dir.empty()) {
         std::printf("  真实网格目录: %s  (ref %d..%d, limit=%d, seed=%d)\n",
                     cfg.mesh_dir.c_str(), cfg.mesh_dir_min_ref,
@@ -1113,6 +1309,9 @@ int main(int argc, char** argv)
                     cfg.mesh_dir_seed);
         if (cfg.no_synthetic)
             std::printf("  (合成 Cartesian 网格已禁用，仅使用真实网格)\n");
+        if (cfg.jitter_strength > 0 && cfg.jitter_copies > 0)
+            std::printf("  节点抖动  : strength=%.2g, copies=%d, seed=%d\n",
+                        cfg.jitter_strength, cfg.jitter_copies, cfg.jitter_seed);
     }
     std::printf("  输出      : %s  (最优子集: %s)\n",
                 cfg.output_all.c_str(), cfg.output_best.c_str());
@@ -1195,66 +1394,262 @@ int main(int argc, char** argv)
         }
     }
 
+    // ── 物理参数 sweep：dense 模式开启更密的网格 ────────────
+    // dense 模式下每个 sweep 的取样翻倍；与默认共享 prefix 以便训练集稳定增长。
+    auto sweep_steady_k = [&]() -> std::vector<double> {
+        if (cfg.dense)
+            return {0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 1000.0};
+        return        {1.0, 5.0, 10.0, 50.0, 100.0};
+    };
+    auto sweep_aniso = [&]() -> std::vector<std::tuple<double,double,double>> {
+        if (cfg.dense) return {
+            {10.0,   1.0,   1.0}, {100.0,  1.0,   1.0}, {1000.0, 1.0,   1.0},
+            {1.0,   100.0,  1.0}, {1.0,   1000.0, 1.0}, {1.0,    1.0,  100.0},
+            {0.1,   17.0,  123.0},{5.0,  1000.0, 500.0},{50.0,   50.0,  1.0},
+            {1.0,    1.0,  0.01},
+        };
+        return {
+            {10.0, 1.0, 1.0}, {100.0, 1.0, 1.0}, {1.0, 100.0, 1.0},
+            {0.1, 17.0, 123.0}, {5.0, 1000.0, 500.0},
+        };
+    };
+    auto sweep_multimat = [&]() -> std::vector<double> {
+        if (cfg.dense)
+            return {2.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 1e4, 1e5, 1e6, 1e8};
+        return        {10.0, 50.0, 100.0, 500.0, 1000.0, 1e6};
+    };
+    auto sweep_convdiff = [&]() -> std::vector<double> {
+        if (cfg.dense)
+            return {0.1, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0};
+        return        {1.0, 10.0, 100.0};
+    };
+    auto sweep_robin = [&]() -> std::vector<double> {
+        if (cfg.dense)
+            return {0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0};
+        return        {0.1, 1.0, 10.0, 50.0, 100.0, 500.0, 1000.0};
+    };
+    auto sweep_dt = [&]() -> std::vector<double> {
+        if (cfg.dense)
+            return {1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0};
+        return        {1e-5, 1e-4, 1e-3, 1e-2, 1e-1};
+    };
+    auto sweep_nonlin = [&]() -> std::vector<double> {
+        if (cfg.dense)
+            return {0.01, 0.1, 0.5, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 500.0};
+        return        {0.1, 1.0, 5.0, 10.0, 50.0, 100.0};
+    };
+    auto sweep_reaction = [&]() -> std::vector<double> {
+        if (cfg.dense)
+            return {1e-4, 1e-3, 1e-2, 1e-1, 1.0, 5.0, 10.0, 50.0, 100.0, 1000.0, 1e4};
+        return        {0.01, 0.1, 1.0, 10.0, 100.0, 1000.0};
+    };
+    auto sweep_aniso_mat = [&]() {
+        // (kx, ky, kz, contrast)
+        std::vector<std::tuple<double,double,double,double>> v;
+        if (cfg.dense) v = {
+            {10.0,  1.0,  1.0, 10.0},   {100.0, 1.0,  1.0, 100.0},
+            {1.0,   100.0, 1.0, 50.0},  {10.0, 10.0, 1.0, 1000.0},
+            {1.0,   1000.0, 1.0, 1e4},  {100.0, 1.0,  1.0, 1e6},
+            {1.0,   100.0, 100.0, 50.0},{10.0, 100.0, 1.0, 100.0},
+        };
+        else v = {
+            {10.0, 1.0, 1.0, 100.0}, {100.0, 1.0, 1.0, 1000.0}, {1.0, 100.0, 1.0, 50.0},
+        };
+        return v;
+    };
+    auto sweep_conv_aniso = [&]() {
+        // (peclet, k_ratio)
+        std::vector<std::pair<double,double>> v;
+        if (cfg.dense) v = {
+            {1.0, 1.0},  {10.0, 1.0},  {100.0, 1.0},  {1000.0, 1.0},
+            {1.0, 10.0}, {10.0, 10.0}, {100.0, 10.0},
+            {10.0, 100.0}, {100.0, 100.0},
+        };
+        else v = {{10.0, 10.0}, {100.0, 1.0}, {100.0, 100.0}};
+        return v;
+    };
+
     // 统一的"跑一个物理问题"包装（每次新建 FES）
     // mt_label_in: 来自调用方的 mesh_type 字符串 (合成 = MeshTypeName(mc.type)，
     //              文件网格 = MeshTypeLabel(*mesh)，可能为 MIXED/WEDGE 等)
     auto run_case = [&](const std::string& pname, Mesh& mesh, int ref,
-                         const MeshCase& mc, const std::string& mt_label_in,
+                         int order, const std::string& mt_label_in,
                          std::function<AssembledSystem(
                              FiniteElementSpace&, HeatResult&)> builder) {
         try {
             int dim = mesh.Dimension();
-            H1_FECollection fec(cfg.order, dim);
+            H1_FECollection fec(order, dim);
             FiniteElementSpace fes(&mesh, &fec);
 
             // max_dof 早退（按真实 DOF 数）
             if (cfg.max_dof > 0 && fes.GetTrueVSize() > cfg.max_dof) {
                 if (cfg.verbose)
-                    std::fprintf(stderr, "  [skip] %s DOF=%d 超 max_dof\n",
-                                 pname.c_str(), fes.GetTrueVSize());
+                    std::fprintf(stderr, "  [skip] %s P%d DOF=%d 超 max_dof\n",
+                                 pname.c_str(), order, fes.GetTrueVSize());
                 return;
             }
 
             HeatResult base;
             base.dim        = dim;
             base.ref_level  = ref;
-            base.poly_order = cfg.order;
+            base.poly_order = order;
             auto sys = builder(fes, base);
             if (!sys.valid) return;
             RunProblemSuite(mesh, fes, pname, mt_label_in,
                              std::move(sys), base, cfg, all, has_direct);
         } catch (const std::exception& e) {
             std::fprintf(stderr,
-                "  [skip] %s (%s ref=%d) 组装失败: %s\n",
-                pname.c_str(), mt_label_in.c_str(), ref, e.what());
+                "  [skip] %s (%s ref=%d P%d) 组装失败: %s\n",
+                pname.c_str(), mt_label_in.c_str(), ref, order, e.what());
         }
     };
 
-    // ── 遍历：网格 × 精炼级 × 物理问题 × 求解器 ─────────────
+    // ── 跑某个具体 mesh × ref × order 上所有物理问题 ──────────
+    auto run_all_physics =
+        [&](Mesh& mesh, int ref, int order, const std::string& mt_label)
+    {
+        // 1. 稳态均匀（不同 k 值）
+        if (cfg.run_steady) {
+            for (double k_val : sweep_steady_k()) {
+                std::ostringstream oss;
+                oss << "SteadyHeat_k" << k_val;
+                run_case(oss.str(), mesh, ref, order, mt_label,
+                    [&](FiniteElementSpace& fes, HeatResult& r){
+                        return BuildSteadyHeat(mesh, fes, k_val, r);
+                    });
+            }
+        }
+        // 2. 各向异性
+        if (cfg.run_aniso) {
+            for (auto [kx, ky, kz] : sweep_aniso()) {
+                std::ostringstream oss;
+                oss << "AnisoHeat_" << (int)kx << "_" << (int)ky;
+                run_case(oss.str(), mesh, ref, order, mt_label,
+                    [&](FiniteElementSpace& fes, HeatResult& r){
+                        return BuildAnisoHeat(mesh, fes, kx, ky, kz, r);
+                    });
+            }
+        }
+        // 3. 多材料
+        if (cfg.run_multi_mat) {
+            for (double c : sweep_multimat()) {
+                std::ostringstream oss;
+                oss << "MultiMat_c1e" << (int)std::log10(std::max(c, 1.0));
+                run_case(oss.str(), mesh, ref, order, mt_label,
+                    [&](FiniteElementSpace& fes, HeatResult& r){
+                        return BuildMultiMatHeat(mesh, fes, c, r);
+                    });
+            }
+        }
+        // 4. 对流-扩散 (现在默认启用)
+        if (cfg.run_convdiff) {
+            for (double pe : sweep_convdiff()) {
+                std::ostringstream oss;
+                oss << "ConvDiff_Pe" << (int)pe;
+                run_case(oss.str(), mesh, ref, order, mt_label,
+                    [&](FiniteElementSpace& fes, HeatResult& r){
+                        return BuildConvDiffHeat(mesh, fes, pe, r);
+                    });
+            }
+        }
+        // 5. 罗宾/辐射边界
+        if (cfg.run_robin) {
+            for (double hc : sweep_robin()) {
+                std::ostringstream oss;
+                oss << "RobinHeat_h" << (int)hc;
+                run_case(oss.str(), mesh, ref, order, mt_label,
+                    [&](FiniteElementSpace& fes, HeatResult& r){
+                        return BuildRobinHeat(mesh, fes, hc, r);
+                    });
+            }
+        }
+        // 6. 瞬态（隐式 BE）
+        if (cfg.run_transient) {
+            for (double dt : sweep_dt()) {
+                std::ostringstream oss;
+                oss << "Transient_dt" << std::scientific
+                    << std::setprecision(0) << dt;
+                run_case(oss.str(), mesh, ref, order, mt_label,
+                    [&](FiniteElementSpace& fes, HeatResult& r){
+                        return BuildTransientStep(mesh, fes, dt, r);
+                    });
+            }
+        }
+        // 7. 非线性 Newton 线性化步
+        if (cfg.run_nonlinear) {
+            for (double alpha : sweep_nonlin()) {
+                std::ostringstream oss;
+                oss << "Nonlinear_a" << std::fixed
+                    << std::setprecision(1) << alpha;
+                run_case(oss.str(), mesh, ref, order, mt_label,
+                    [&](FiniteElementSpace& fes, HeatResult& r){
+                        return BuildNonlinearStep(mesh, fes, alpha, r);
+                    });
+            }
+        }
+        // 8. 反应-扩散 (新)
+        if (cfg.run_react_diff) {
+            for (double rxn : sweep_reaction()) {
+                std::ostringstream oss;
+                oss << "ReactDiff_r" << std::scientific
+                    << std::setprecision(0) << rxn;
+                run_case(oss.str(), mesh, ref, order, mt_label,
+                    [&](FiniteElementSpace& fes, HeatResult& r){
+                        return BuildReactionDiffusion(mesh, fes, rxn, r);
+                    });
+            }
+        }
+        // 9. 复合：各向异性 + 多材料 (新)
+        if (cfg.run_aniso_mat) {
+            for (auto [kx, ky, kz, c] : sweep_aniso_mat()) {
+                std::ostringstream oss;
+                oss << "AnisoMat_" << (int)kx << "_" << (int)ky
+                    << "_c1e" << (int)std::log10(std::max(c, 1.0));
+                run_case(oss.str(), mesh, ref, order, mt_label,
+                    [&](FiniteElementSpace& fes, HeatResult& r){
+                        return BuildAnisoMultiMat(mesh, fes, kx, ky, kz, c, r);
+                    });
+            }
+        }
+        // 10. 复合：对流 + 各向异性 (新)
+        if (cfg.run_conv_aniso) {
+            for (auto [pe, kr] : sweep_conv_aniso()) {
+                std::ostringstream oss;
+                oss << "ConvAniso_Pe" << (int)pe << "_k" << (int)kr;
+                run_case(oss.str(), mesh, ref, order, mt_label,
+                    [&](FiniteElementSpace& fes, HeatResult& r){
+                        return BuildConvAniso(mesh, fes, pe, kr, r);
+                    });
+            }
+        }
+    };
+
+    // ── 遍历：网格 × 精炼级 × (jitter 副本) × order × 物理问题 × 求解器 ─
     for (const auto& mc : mesh_cases) {
         for (int ref = mc.min_ref; ref <= mc.max_ref; ++ref) {
-            std::shared_ptr<Mesh> mesh;
+            // 1. 先加载/生成原始 mesh 一次
+            std::shared_ptr<Mesh> mesh_orig;
             try {
                 if (mc.mesh_file.empty()) {
-                    mesh = MakeMesh(mc.dim, mc.type, ref);
+                    mesh_orig = MakeMesh(mc.dim, mc.type, ref);
                 } else {
-                    mesh = LoadMeshFromFile(mc.mesh_file, ref);
-                    if (!mesh) continue;
+                    mesh_orig = LoadMeshFromFile(mc.mesh_file, ref);
+                    if (!mesh_orig) continue;
                 }
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "  [skip] mesh %s ref=%d: %s\n",
                              mc.label.c_str(), ref, e.what());
                 continue;
             }
-            if (!mesh) continue;
+            if (!mesh_orig) continue;
 
-            // mesh_type 标签：文件网格用真实主类型 (含 MIXED)
+            // 2. mesh_type 标签（一次性确定）
             std::string mt_label = mc.mesh_file.empty()
                 ? MeshTypeName(mc.type)
-                : MeshTypeLabel(*mesh);
+                : MeshTypeLabel(*mesh_orig);
 
-            // 大 DOF 早退（用 P1 估计上界；高阶时还会更大）
-            int est_dof = mesh->GetNV();
+            // 3. 大 DOF 早退（顶点数估计上界）
+            int est_dof = mesh_orig->GetNV();
             if (cfg.max_dof > 0 && est_dof > cfg.max_dof) {
                 if (cfg.verbose)
                     std::fprintf(stderr, "  [skip] %s ref=%d 顶点=%d 超 max_dof\n",
@@ -1262,99 +1657,33 @@ int main(int argc, char** argv)
                 continue;
             }
 
-            std::printf("\n\033[36m── %s %dD %s  ref=%d  (elements=%d) ──\033[0m\n",
-                        mc.label.c_str(), mc.dim, mt_label.c_str(),
-                        ref, mesh->GetNE());
+            // 4. 决定要跑多少 jitter 副本（仅真实网格生效）
+            bool can_jitter = !mc.mesh_file.empty()
+                              && cfg.jitter_strength > 0.0
+                              && cfg.jitter_copies > 0;
+            int n_copies = can_jitter ? (1 + cfg.jitter_copies) : 1;
 
-            // 1. 稳态均匀（不同 k 值）
-            if (cfg.run_steady) {
-                std::vector<double> x = {1.0, 5.0 ,10.0, 50.0 , 100.0};
-                for (double k_val : x) {
-                    std::string pname = "SteadyHeat_k" + std::to_string((int)k_val);
-                    run_case(pname, *mesh, ref, mc, mt_label,
-                        [&](FiniteElementSpace& fes, HeatResult& r){
-                            return BuildSteadyHeat(*mesh, fes, k_val, r);
-                        });
+            for (int copy = 0; copy < n_copies; ++copy) {
+                std::shared_ptr<Mesh> mesh;
+                std::string copy_tag;
+                if (copy == 0) {
+                    mesh = mesh_orig;
+                } else {
+                    mesh = std::make_shared<Mesh>(*mesh_orig, /*copy_nodes=*/true);
+                    JitterMesh(*mesh, cfg.jitter_strength,
+                                static_cast<unsigned>(
+                                    cfg.jitter_seed + 7919u * copy + 31u * ref));
+                    copy_tag = "  [jitter#" + std::to_string(copy) + "]";
                 }
-            }
 
-            // 2. 各向异性
-            if (cfg.run_aniso) {
-                std::vector<std::tuple<double,double,double>> cases = {
-                    {10.0, 1.0, 1.0},
-                    {100.0, 1.0, 1.0},
-                    {1.0, 100.0, 1.0},
-                    {0.1, 17.0,  123.0},
-                    {5.0, 1000.0, 500.0},
-                };
-                for (auto [kx, ky, kz] : cases) {
-                    std::string pname = "AnisoHeat_"+std::to_string((int)kx)
-                                         + "_" + std::to_string((int)ky);
-                    run_case(pname, *mesh, ref, mc, mt_label,
-                        [&](FiniteElementSpace& fes, HeatResult& r){
-                            return BuildAnisoHeat(*mesh, fes, kx, ky, kz, r);
-                        });
-                }
-            }
-
-            // 3. 多材料
-            if (cfg.run_multi_mat) {
-                for (double c : {10.0, 50.0, 100.0, 500.0, 1000.0, 1e6}) {
-                    std::ostringstream oss;
-                    oss << "MultiMat_c1e" << (int)std::log10(c);
-                    run_case(oss.str(), *mesh, ref, mc, mt_label,
-                        [&](FiniteElementSpace& fes, HeatResult& r){
-                            return BuildMultiMatHeat(*mesh, fes, c, r);
-                        });
-                }
-            }
-
-            // // 4. 对流-扩散
-            // if (cfg.run_convdiff) {
-            //     for (double pe : {1.0, 10.0, 100.0}) {
-            //         std::string pname = "ConvDiff_Pe" + std::to_string((int)pe);
-            //         run_case(pname, *mesh, ref, mc,
-            //             [&](FiniteElementSpace& fes, HeatResult& r){
-            //                 return BuildConvDiffHeat(*mesh, fes, pe, r);
-            //             });
-            //     }
-            // }
-
-            // 5. 罗宾/辐射边界
-            if (cfg.run_robin) {
-                for (double hc : {0.1, 1.0, 10.0, 50.0, 100.0, 500.0 ,1000.0}) {
-                    std::ostringstream oss;
-                    oss << "RobinHeat_h" << (int)hc;
-                    run_case(oss.str(), *mesh, ref, mc, mt_label,
-                        [&](FiniteElementSpace& fes, HeatResult& r){
-                            return BuildRobinHeat(*mesh, fes, hc, r);
-                        });
-                }
-            }
-
-            // 6. 瞬态（隐式 BE）
-            if (cfg.run_transient) {
-                for (double dt : {1e-5, 1e-4, 1e-3, 1e-2, 1e-1}) {
-                    std::ostringstream oss;
-                    oss << "Transient_dt" << std::scientific
-                        << std::setprecision(0) << dt;
-                    run_case(oss.str(), *mesh, ref, mc, mt_label,
-                        [&](FiniteElementSpace& fes, HeatResult& r){
-                            return BuildTransientStep(*mesh, fes, dt, r);
-                        });
-                }
-            }
-
-            // 7. 非线性 Newton 线性化步
-            if (cfg.run_nonlinear) {
-                for (double alpha : {0.1, 1.0, 5.0, 10.0, 50.0, 100.0}) {
-                    std::ostringstream oss;
-                    oss << "Nonlinear_a" << std::fixed
-                        << std::setprecision(1) << alpha;
-                    run_case(oss.str(), *mesh, ref, mc, mt_label,
-                        [&](FiniteElementSpace& fes, HeatResult& r){
-                            return BuildNonlinearStep(*mesh, fes, alpha, r);
-                        });
+                // 5. 对每个 polynomial order 跑全套物理
+                for (int order : cfg.orders) {
+                    std::printf("\n\033[36m── %s%s %dD %s  ref=%d  P%d  "
+                                "(elements=%d) ──\033[0m\n",
+                                mc.label.c_str(), copy_tag.c_str(),
+                                mc.dim, mt_label.c_str(), ref, order,
+                                mesh->GetNE());
+                    run_all_physics(*mesh, ref, order, mt_label);
                 }
             }
         }

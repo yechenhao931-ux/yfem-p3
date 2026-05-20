@@ -53,6 +53,8 @@
 // ======================================================================
 
 /// 热传导问题家族（必须与 Python 训练数据中的 problem_family 对齐）
+/// 这些字符串必须与 collect_heat_data.cpp 中生成 problem 名时 split("_")[0]
+/// 的结果完全一致。
 enum class ProblemFamily {
     SteadyHeat,
     AnisoHeat,
@@ -61,6 +63,9 @@ enum class ProblemFamily {
     RobinHeat,
     Transient,
     Nonlinear,
+    ReactDiff,    // v3.1: (K + r·M) u = f
+    AnisoMat,     // v3.1: anisotropy + multi-material
+    ConvAniso,    // v3.1: convection + anisotropy
     Unknown,
 };
 
@@ -73,6 +78,9 @@ inline const char* ProblemFamilyName(ProblemFamily p) {
         case ProblemFamily::RobinHeat:  return "RobinHeat";
         case ProblemFamily::Transient:  return "Transient";
         case ProblemFamily::Nonlinear:  return "Nonlinear";
+        case ProblemFamily::ReactDiff:  return "ReactDiff";
+        case ProblemFamily::AnisoMat:   return "AnisoMat";
+        case ProblemFamily::ConvAniso:  return "ConvAniso";
         default:                         return "Unknown";
     }
 }
@@ -85,6 +93,9 @@ inline ProblemFamily ParseProblemFamily(const std::string& s) {
     if (s == "RobinHeat")  return ProblemFamily::RobinHeat;
     if (s == "Transient")  return ProblemFamily::Transient;
     if (s == "Nonlinear")  return ProblemFamily::Nonlinear;
+    if (s == "ReactDiff")  return ProblemFamily::ReactDiff;
+    if (s == "AnisoMat")   return ProblemFamily::AnisoMat;
+    if (s == "ConvAniso")  return ProblemFamily::ConvAniso;
     return ProblemFamily::Unknown;
 }
 
