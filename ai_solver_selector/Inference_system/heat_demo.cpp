@@ -46,6 +46,7 @@ struct DemoConfig {
     std::string problem    = "steady";   // steady|aniso|multimat|convdiff|robin
     int         dim        = 2;
     std::string mesh_type  = "quad";     // quad|tri|hex|tet
+    std::string mesh_file  = "";         // 非空 → 从文件读入；忽略 dim/mesh_type
     int         ref        = 3;
     int         order      = 1;
 
@@ -69,6 +70,7 @@ DemoConfig ParseArgs(int argc, char** argv) {
         else if (a == "--problem"  && i+1<argc) c.problem    = argv[++i];
         else if (a == "--dim"      && i+1<argc) c.dim        = std::stoi(argv[++i]);
         else if (a == "--mesh"     && i+1<argc) c.mesh_type  = argv[++i];
+        else if (a == "--mesh-file"&& i+1<argc) c.mesh_file  = argv[++i];
         else if (a == "--ref"      && i+1<argc) c.ref        = std::stoi(argv[++i]);
         else if (a == "--order"    && i+1<argc) c.order      = std::stoi(argv[++i]);
         else if (a == "--k"        && i+1<argc) c.k_ratio    = std::stod(argv[++i]);
@@ -154,23 +156,44 @@ Problem BuildProblem(const DemoConfig& cfg)
     };
 
     Problem p;
+    int dim_actual;
 
     // 1. 网格
-    Element::Type etype = ParseMeshType(cfg.mesh_type, cfg.dim);
-    int n0 = (etype == Element::TRIANGLE
-              || etype == Element::TETRAHEDRON) ? 2 : 1;
-    if (cfg.dim == 2) {
-        p.mesh = std::make_shared<Mesh>(
-            Mesh::MakeCartesian2D(n0, n0, etype, true, 1.0, 1.0));
+    if (!cfg.mesh_file.empty()) {
+        // 真实网格文件（如 /home/user/yfem-p3/data/star.mesh）
+        p.mesh = std::make_shared<Mesh>(cfg.mesh_file, 1, 1);
+        // 拒绝 NURBS / 曲面（与数据收集端口径一致）
+        if (p.mesh->NURBSext != nullptr) {
+            std::fprintf(stderr, "[ERR] NURBS 网格暂不支持: %s\n",
+                         cfg.mesh_file.c_str());
+            std::exit(1);
+        }
+        if (p.mesh->SpaceDimension() != p.mesh->Dimension()) {
+            std::fprintf(stderr, "[ERR] 不支持曲面网格 (sdim=%d, dim=%d): %s\n",
+                         p.mesh->SpaceDimension(), p.mesh->Dimension(),
+                         cfg.mesh_file.c_str());
+            std::exit(1);
+        }
+        for (int i = 0; i < cfg.ref; ++i) p.mesh->UniformRefinement();
+        dim_actual = p.mesh->Dimension();
     } else {
-        p.mesh = std::make_shared<Mesh>(
-            Mesh::MakeCartesian3D(n0, n0, n0, etype, 1.0, 1.0, 1.0));
+        Element::Type etype = ParseMeshType(cfg.mesh_type, cfg.dim);
+        int n0 = (etype == Element::TRIANGLE
+                  || etype == Element::TETRAHEDRON) ? 2 : 1;
+        if (cfg.dim == 2) {
+            p.mesh = std::make_shared<Mesh>(
+                Mesh::MakeCartesian2D(n0, n0, etype, true, 1.0, 1.0));
+        } else {
+            p.mesh = std::make_shared<Mesh>(
+                Mesh::MakeCartesian3D(n0, n0, n0, etype, 1.0, 1.0, 1.0));
+        }
+        p.mesh->EnsureNodes();
+        for (int i = 0; i < cfg.ref; ++i) p.mesh->UniformRefinement();
+        dim_actual = cfg.dim;
     }
-    p.mesh->EnsureNodes();
-    for (int i = 0; i < cfg.ref; ++i) p.mesh->UniformRefinement();
 
     // 2. 有限元空间
-    p.fec.reset(new H1_FECollection(cfg.order, cfg.dim));
+    p.fec.reset(new H1_FECollection(cfg.order, dim_actual));
     p.fes.reset(new FiniteElementSpace(p.mesh.get(), p.fec.get()));
 
     auto t0 = Clock::now();
@@ -191,13 +214,13 @@ Problem BuildProblem(const DemoConfig& cfg)
         p.desc.problem_family = ProblemFamily::AnisoHeat;
         p.desc.k_ratio = cfg.k_ratio;
         double kx = cfg.k_ratio, ky = 1.0, kz = 1.0;
-        p.K_coef.reset(new AnisoK(cfg.dim, kx, ky, kz));
+        p.K_coef.reset(new AnisoK(dim_actual, kx, ky, kz));
         p.a->AddDomainIntegrator(new DiffusionIntegrator(*p.K_coef));
     }
     else if (cfg.problem == "multimat") {
         p.desc.problem_family    = ProblemFamily::MultiMat;
         p.desc.material_contrast = cfg.material_contrast;
-        Vector center(cfg.dim); center = 0.5;
+        Vector center(dim_actual); center = 0.5;
         p.k_coef.reset(new HeterogeneousK(1.0, cfg.material_contrast,
                                             center, 0.25));
         p.a->AddDomainIntegrator(new DiffusionIntegrator(*p.k_coef));
@@ -212,8 +235,8 @@ Problem BuildProblem(const DemoConfig& cfg)
         p.k_coef.reset(new ConstantCoefficient(k_val));
         p.a->AddDomainIntegrator(new DiffusionIntegrator(*p.k_coef));
 
-        Vector vv(cfg.dim); vv = 0.0; vv(0) = v_mag;
-        if (cfg.dim > 1) vv(1) = 0.5 * v_mag;
+        Vector vv(dim_actual); vv = 0.0; vv(0) = v_mag;
+        if (dim_actual > 1) vv(1) = 0.5 * v_mag;
         p.v_coef.reset(new VectorConstantCoefficient(vv));
         p.a->AddDomainIntegrator(new ConvectionIntegrator(*p.v_coef, 1.0));
     }
@@ -261,8 +284,13 @@ int main(int argc, char** argv)
     std::printf("║   MFEM 热传导 + PyTorch MLP 自动求解器选择           ║\n");
     std::printf("╚══════════════════════════════════════════════════════╝\n");
     std::printf("  问题:    %s\n",          cfg.problem.c_str());
-    std::printf("  网格:    %dD %s (ref=%d, P%d)\n",
-                cfg.dim, cfg.mesh_type.c_str(), cfg.ref, cfg.order);
+    if (cfg.mesh_file.empty()) {
+        std::printf("  网格:    %dD %s (ref=%d, P%d)\n",
+                    cfg.dim, cfg.mesh_type.c_str(), cfg.ref, cfg.order);
+    } else {
+        std::printf("  网格:    [文件] %s (ref=%d, P%d)\n",
+                    cfg.mesh_file.c_str(), cfg.ref, cfg.order);
+    }
     std::printf("  模型:    %s\n",          cfg.model_path.c_str());
     std::printf("  容差:    %.0e\n",         cfg.rtol);
 

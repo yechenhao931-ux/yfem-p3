@@ -60,10 +60,12 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <map>
 #include <memory>
+#include <random>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -111,6 +113,17 @@ struct Config {
 
     // 求解器超时（秒）
     double solver_timeout_s = 30.0;
+
+    // ── 真实网格（来自 mfem/data 等目录）─────────────────────
+    std::string mesh_dir          = "";   // 含 .mesh 的目录；空 = 不使用文件网格
+    int         mesh_dir_min_ref  = 0;
+    int         mesh_dir_max_ref  = 3;
+    int         mesh_dir_limit    = -1;   // 最多采样多少个文件；-1 = 全部
+    int         mesh_dir_seed     = 42;
+    bool        no_synthetic      = false;// true → 只用文件网格，跳过 Cartesian
+
+    // 大型 DOF 上限：跳过会爆内存的组合
+    int  max_dof = 0;                     // 0 = 不限
 
     std::string output_all  = "heat_results.csv";
     std::string output_best = "heat_best.csv";
@@ -161,6 +174,13 @@ Config ParseArgs(int argc, char** argv) {
         else if (a == "--no-tri")    c.run_tri = false;
         else if (a == "--no-tet")    c.run_tet = false;
         else if (a == "--verbose")   c.verbose = true;
+        else if (a == "--mesh-dir"      && i+1<argc) c.mesh_dir         = argv[++i];
+        else if (a == "--mesh-min-ref"  && i+1<argc) c.mesh_dir_min_ref = std::stoi(argv[++i]);
+        else if (a == "--mesh-max-ref"  && i+1<argc) c.mesh_dir_max_ref = std::stoi(argv[++i]);
+        else if (a == "--mesh-limit"    && i+1<argc) c.mesh_dir_limit   = std::stoi(argv[++i]);
+        else if (a == "--mesh-seed"     && i+1<argc) c.mesh_dir_seed    = std::stoi(argv[++i]);
+        else if (a == "--no-synthetic") c.no_synthetic = true;
+        else if (a == "--max-dof"       && i+1<argc) c.max_dof          = std::stoi(argv[++i]);
     }
     return c;
 }
@@ -386,16 +406,29 @@ struct SolverSpec {
 };
 
 std::vector<SolverSpec> GetSolverList(bool has_direct) {
+    // 求解器 + 前提条件器组合。每行 (name, precond, supports_nonsym, is_direct, needs_diag)
+    // 对称 SPD: CG / PCG_*, MINRES / MINRES_Jac
+    // 非对称兼容: GMRES / FGMRES / BiCGSTAB
     std::vector<SolverSpec> list = {
-        {"CG",          "None",      false, false, false},
-        {"PCG_GS",      "GS",        false, false, true },
-        {"PCG_Jacobi",  "Jacobi",    false, false, true },
-        //{"PCG_Cheby",   "Chebyshev", false, false, true },
-        {"MINRES",      "None",      false, false, false},
-        {"MINRES_Jac",  "Jacobi",    false, false, true },
-        {"GMRES",       "None",      true,  false, false},
-        {"GMRES_Jac",   "Jacobi",    true,  false, true },
-        {"GMRES_GS",    "GS",        true,  false, true },
+        // ── Krylov SPD ────────────────────────────────────────────
+        {"CG",            "None",      false, false, false},
+        {"PCG_Jacobi",    "Jacobi",    false, false, true },
+        {"PCG_l1Jac",     "l1Jacobi",  false, false, true },
+        {"PCG_GS",        "GS",        false, false, true },
+        // ── MINRES (对称、可指示) ────────────────────────────────
+        {"MINRES",        "None",      false, false, false},
+        {"MINRES_Jac",    "Jacobi",    false, false, true },
+        // ── GMRES 系 (一般矩阵) ──────────────────────────────────
+        {"GMRES",         "None",      true,  false, false},
+        {"GMRES_Jac",     "Jacobi",    true,  false, true },
+        {"GMRES_GS",      "GS",        true,  false, true },
+        // ── FGMRES (Flexible GMRES，允许变前提条件子) ──────────
+        {"FGMRES_Jac",    "Jacobi",    true,  false, true },
+        {"FGMRES_GS",     "GS",        true,  false, true },
+        // ── BiCGSTAB 系 (低存储，非对称) ────────────────────────
+        {"BiCGSTAB",      "None",      true,  false, false},
+        {"BiCGSTAB_Jac",  "Jacobi",    true,  false, true },
+        {"BiCGSTAB_GS",   "GS",        true,  false, true },
     };
     if (has_direct) {
         list.push_back({"DIRECT_UMF", "LU", true, true, false});
@@ -436,6 +469,8 @@ SolveOutput RunIterative(const std::string& solver_name,
         auto t_setup = Clock::now();
         if      (precond_name == "GS")        prec.reset(new GSSmoother(A));
         else if (precond_name == "Jacobi")    prec.reset(new DSmoother(A, 0));
+        else if (precond_name == "l1Jacobi")  prec.reset(new DSmoother(A, 1));   // l1-Jacobi
+        else if (precond_name == "lumpedJac") prec.reset(new DSmoother(A, 2));   // lumped Jacobi
         else if (precond_name == "Chebyshev") prec.reset(new DSmoother(A, 2, 10));
         out.setup_ms = since(t_setup);
     } catch (const std::exception& e) {
@@ -448,21 +483,28 @@ SolveOutput RunIterative(const std::string& solver_name,
     std::unique_ptr<IterativeSolver> solver_owner;
     IterativeSolver* solver = nullptr;
 
+    // 注意：FGMRES 必须先匹配，否则会被 GMRES 前缀吞掉
     if (solver_name == "CG" || solver_name.substr(0, 3) == "PCG") {
         auto* cg = new CGSolver();
         solver_owner.reset(cg); solver = cg;
     } else if (solver_name.substr(0, 6) == "MINRES") {
         auto* mr = new MINRESSolver();
         solver_owner.reset(mr); solver = mr;
+    } else if (solver_name.substr(0, 6) == "FGMRES") {
+        auto* fg = new FGMRESSolver();
+        fg->SetKDim(cfg.gmres_kdim);
+        solver_owner.reset(fg); solver = fg;
     } else if (solver_name.substr(0, 5) == "GMRES") {
         auto* gm = new GMRESSolver();
         gm->SetKDim(cfg.gmres_kdim);
         solver_owner.reset(gm); solver = gm;
-    } else if (solver_name == "BiCGSTAB" || solver_name == "BiCGSTAB_Jacobi") {
-      auto* bs = new BiCGSTABSolver();
-      solver_owner.reset(bs);
-      solver = bs;
-   }else {
+    } else if (solver_name.substr(0, 8) == "BiCGSTAB") {
+        auto* bs = new BiCGSTABSolver();
+        solver_owner.reset(bs); solver = bs;
+    } else if (solver_name.substr(0, 3) == "SLI") {
+        auto* sl = new SLISolver();
+        solver_owner.reset(sl); solver = sl;
+    } else {
         out.skipped = true;
         return out;
     }
@@ -878,6 +920,87 @@ std::printf("  %s  %-22s %-5s ref=%d  DOF=%7d  nnz=%-8ld  "
 }
 
 // =====================================================================
+//  真实网格读取（mfem/data 等目录里的 .mesh 文件）
+// =====================================================================
+namespace fs = std::filesystem;
+
+// 仅靠文件名快速过滤：NURBS / 周期 / 已知的曲面 / 病态
+static bool MeshNameLooksUsable(const std::string& fname) {
+    static const std::vector<std::string> bad_substr = {
+        "nurbs", "periodic-", "klein-", "mobius",
+        // 已知曲面 (拓扑 dim < 空间 dim)
+        "-surf.", "escher",
+        // 1D
+        "ref-segment", "inline-segment", "segment-",
+    };
+    for (const auto& s : bad_substr)
+        if (fname.find(s) != std::string::npos) return false;
+    return true;
+}
+
+// 枚举目录中的 .mesh 文件，仅按名字预过滤
+std::vector<std::string> EnumerateMeshFiles(const std::string& dir)
+{
+    std::vector<std::string> out;
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return out;
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+        if (!e.is_regular_file()) continue;
+        const auto& p = e.path();
+        if (p.extension() != ".mesh") continue;
+        if (!MeshNameLooksUsable(p.filename().string())) continue;
+        out.push_back(p.string());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// 读取真实网格 + 应用细化；遇到 NURBS / 曲面 / 维度 < 2 / 异常 → 返回 nullptr
+std::shared_ptr<Mesh> LoadMeshFromFile(const std::string& path, int ref)
+{
+    std::shared_ptr<Mesh> m;
+    try {
+        m = std::make_shared<Mesh>(path, /*generate_edges=*/1,
+                                    /*refine=*/1, /*fix_orientation=*/true);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  [skip] 读取失败 %s: %s\n",
+                     path.c_str(), e.what());
+        return nullptr;
+    }
+    if (m->Dimension() < 2) return nullptr;                  // 1D
+    if (m->SpaceDimension() != m->Dimension()) return nullptr; // surface
+    if (m->NURBSext != nullptr) return nullptr;                // NURBS
+
+    try {
+        for (int i = 0; i < ref; ++i) m->UniformRefinement();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "  [skip] %s ref=%d 失败: %s\n",
+                     path.c_str(), ref, e.what());
+        return nullptr;
+    }
+    return m;
+}
+
+// 主单元类型（用于 mesh_type 列）；非纯类型 → MIXED
+std::string MeshTypeLabel(const Mesh& m)
+{
+    if (m.GetNE() == 0) return "EMPTY";
+    Element::Type t0 = m.GetElementType(0);
+    for (int i = 1; i < m.GetNE(); ++i) {
+        if (m.GetElementType(i) != t0) return "MIXED";
+    }
+    switch (t0) {
+        case Element::QUADRILATERAL: return "QUAD";
+        case Element::TRIANGLE:      return "TRI";
+        case Element::HEXAHEDRON:    return "HEX";
+        case Element::TETRAHEDRON:   return "TET";
+        case Element::WEDGE:         return "WEDGE";
+        case Element::PYRAMID:       return "PYRAMID";
+        default:                      return "OTHER";
+    }
+}
+
+// =====================================================================
 //  网格生成（v2：三角/四面体起始网格用 2x2 / 2x2x2 避免退化）
 // =====================================================================
 std::shared_ptr<Mesh> MakeMesh(int dim, Element::Type type, int ref)
@@ -981,6 +1104,16 @@ int main(int argc, char** argv)
     std::printf("  最大迭代  : %d\n", cfg.max_iter);
     std::printf("  超时      : %.1f s\n", cfg.solver_timeout_s);
     std::printf("  直接法上限: %d DOF\n", cfg.direct_max_dof);
+    if (cfg.max_dof > 0)
+        std::printf("  max_dof   : %d (超过则跳过该 case)\n", cfg.max_dof);
+    if (!cfg.mesh_dir.empty()) {
+        std::printf("  真实网格目录: %s  (ref %d..%d, limit=%d, seed=%d)\n",
+                    cfg.mesh_dir.c_str(), cfg.mesh_dir_min_ref,
+                    cfg.mesh_dir_max_ref, cfg.mesh_dir_limit,
+                    cfg.mesh_dir_seed);
+        if (cfg.no_synthetic)
+            std::printf("  (合成 Cartesian 网格已禁用，仅使用真实网格)\n");
+    }
     std::printf("  输出      : %s  (最优子集: %s)\n",
                 cfg.output_all.c_str(), cfg.output_best.c_str());
 
@@ -996,45 +1129,104 @@ int main(int argc, char** argv)
 #endif
 
     // 构造所有 (dim, 单元类型, 精炼范围) 组合
-    struct MeshCase { int dim; Element::Type type; int min_ref, max_ref; };
+    //   mesh_file 为空 → 合成 Cartesian；非空 → 从该文件读取
+    struct MeshCase {
+        int dim;
+        Element::Type type;       // 仅合成网格用；文件网格在读后再确定
+        int min_ref, max_ref;
+        std::string mesh_file;    // "" = 合成
+        std::string label;        // 用于显示
+    };
     std::vector<MeshCase> mesh_cases;
-    if (cfg.run_2d) {
-        if (cfg.run_quad)
-            mesh_cases.push_back({2, Element::QUADRILATERAL,
-                                   cfg.min_ref_2d, cfg.max_ref_2d});
-        if (cfg.run_tri)
-            mesh_cases.push_back({2, Element::TRIANGLE,
-                                   cfg.min_ref_2d, cfg.max_ref_2d});
+
+    // ── 1) 合成 Cartesian 网格 ─────────────────────────────────
+    if (!cfg.no_synthetic) {
+        if (cfg.run_2d) {
+            if (cfg.run_quad)
+                mesh_cases.push_back({2, Element::QUADRILATERAL,
+                                       cfg.min_ref_2d, cfg.max_ref_2d,
+                                       "", "Cart2D_QUAD"});
+            if (cfg.run_tri)
+                mesh_cases.push_back({2, Element::TRIANGLE,
+                                       cfg.min_ref_2d, cfg.max_ref_2d,
+                                       "", "Cart2D_TRI"});
+        }
+        if (cfg.run_3d) {
+            if (cfg.run_hex)
+                mesh_cases.push_back({3, Element::HEXAHEDRON,
+                                       cfg.min_ref_3d, cfg.max_ref_3d,
+                                       "", "Cart3D_HEX"});
+            if (cfg.run_tet)
+                mesh_cases.push_back({3, Element::TETRAHEDRON,
+                                       cfg.min_ref_3d, cfg.max_ref_3d,
+                                       "", "Cart3D_TET"});
+        }
     }
-    if (cfg.run_3d) {
-        if (cfg.run_hex)
-            mesh_cases.push_back({3, Element::HEXAHEDRON,
-                                   cfg.min_ref_3d, cfg.max_ref_3d});
-        if (cfg.run_tet)
-            mesh_cases.push_back({3, Element::TETRAHEDRON,
-                                   cfg.min_ref_3d, cfg.max_ref_3d});
+
+    // ── 2) 真实网格文件 (mfem/data/*.mesh 等) ──────────────────
+    if (!cfg.mesh_dir.empty()) {
+        auto files = EnumerateMeshFiles(cfg.mesh_dir);
+        if (cfg.mesh_dir_limit > 0 && (int)files.size() > cfg.mesh_dir_limit) {
+            std::mt19937 rng(cfg.mesh_dir_seed);
+            std::shuffle(files.begin(), files.end(), rng);
+            files.resize(cfg.mesh_dir_limit);
+            std::sort(files.begin(), files.end());
+        }
+        std::printf("\n\033[36m── 真实网格目录:\033[0m %s  (%zu 个文件入选)\n",
+                    cfg.mesh_dir.c_str(), files.size());
+        for (const auto& f : files) {
+            // 预探测维度 + 主单元类型 (无细化)
+            std::shared_ptr<Mesh> probe = LoadMeshFromFile(f, 0);
+            if (!probe) {
+                if (cfg.verbose)
+                    std::fprintf(stderr, "  [跳过] %s 不可用\n", f.c_str());
+                continue;
+            }
+            int dim = probe->Dimension();
+            // 主类型 (注意 MIXED 已经在 MeshTypeLabel 里处理；此处只用于
+            // 决定是否被 cfg.run_quad/tri/hex/tet/all 包含)
+            Element::Type t0 = probe->GetElementType(0);
+            std::string label =
+                fs::path(f).stem().string();  // 文件名（无扩展）
+
+            mesh_cases.push_back({dim, t0,
+                                   cfg.mesh_dir_min_ref, cfg.mesh_dir_max_ref,
+                                   f, label});
+        }
     }
 
     // 统一的"跑一个物理问题"包装（每次新建 FES）
+    // mt_label_in: 来自调用方的 mesh_type 字符串 (合成 = MeshTypeName(mc.type)，
+    //              文件网格 = MeshTypeLabel(*mesh)，可能为 MIXED/WEDGE 等)
     auto run_case = [&](const std::string& pname, Mesh& mesh, int ref,
-                         const MeshCase& mc,
+                         const MeshCase& mc, const std::string& mt_label_in,
                          std::function<AssembledSystem(
                              FiniteElementSpace&, HeatResult&)> builder) {
         try {
-            H1_FECollection fec(cfg.order, mc.dim);
+            int dim = mesh.Dimension();
+            H1_FECollection fec(cfg.order, dim);
             FiniteElementSpace fes(&mesh, &fec);
+
+            // max_dof 早退（按真实 DOF 数）
+            if (cfg.max_dof > 0 && fes.GetTrueVSize() > cfg.max_dof) {
+                if (cfg.verbose)
+                    std::fprintf(stderr, "  [skip] %s DOF=%d 超 max_dof\n",
+                                 pname.c_str(), fes.GetTrueVSize());
+                return;
+            }
+
             HeatResult base;
-            base.dim        = mc.dim;
+            base.dim        = dim;
             base.ref_level  = ref;
             base.poly_order = cfg.order;
             auto sys = builder(fes, base);
             if (!sys.valid) return;
-            RunProblemSuite(mesh, fes, pname, MeshTypeName(mc.type),
+            RunProblemSuite(mesh, fes, pname, mt_label_in,
                              std::move(sys), base, cfg, all, has_direct);
         } catch (const std::exception& e) {
             std::fprintf(stderr,
                 "  [skip] %s (%s ref=%d) 组装失败: %s\n",
-                pname.c_str(), MeshTypeName(mc.type).c_str(), ref, e.what());
+                pname.c_str(), mt_label_in.c_str(), ref, e.what());
         }
     };
 
@@ -1043,16 +1235,35 @@ int main(int argc, char** argv)
         for (int ref = mc.min_ref; ref <= mc.max_ref; ++ref) {
             std::shared_ptr<Mesh> mesh;
             try {
-                mesh = MakeMesh(mc.dim, mc.type, ref);
+                if (mc.mesh_file.empty()) {
+                    mesh = MakeMesh(mc.dim, mc.type, ref);
+                } else {
+                    mesh = LoadMeshFromFile(mc.mesh_file, ref);
+                    if (!mesh) continue;
+                }
             } catch (const std::exception& e) {
-                std::fprintf(stderr, "  [skip] mesh %dD %s ref=%d: %s\n",
-                             mc.dim, MeshTypeName(mc.type).c_str(), ref,
-                             e.what());
+                std::fprintf(stderr, "  [skip] mesh %s ref=%d: %s\n",
+                             mc.label.c_str(), ref, e.what());
+                continue;
+            }
+            if (!mesh) continue;
+
+            // mesh_type 标签：文件网格用真实主类型 (含 MIXED)
+            std::string mt_label = mc.mesh_file.empty()
+                ? MeshTypeName(mc.type)
+                : MeshTypeLabel(*mesh);
+
+            // 大 DOF 早退（用 P1 估计上界；高阶时还会更大）
+            int est_dof = mesh->GetNV();
+            if (cfg.max_dof > 0 && est_dof > cfg.max_dof) {
+                if (cfg.verbose)
+                    std::fprintf(stderr, "  [skip] %s ref=%d 顶点=%d 超 max_dof\n",
+                                 mc.label.c_str(), ref, est_dof);
                 continue;
             }
 
-            std::printf("\n\033[36m── %dD %s  ref=%d  (elements=%d) ──\033[0m\n",
-                        mc.dim, MeshTypeName(mc.type).c_str(),
+            std::printf("\n\033[36m── %s %dD %s  ref=%d  (elements=%d) ──\033[0m\n",
+                        mc.label.c_str(), mc.dim, mt_label.c_str(),
                         ref, mesh->GetNE());
 
             // 1. 稳态均匀（不同 k 值）
@@ -1060,7 +1271,7 @@ int main(int argc, char** argv)
                 std::vector<double> x = {1.0, 5.0 ,10.0, 50.0 , 100.0};
                 for (double k_val : x) {
                     std::string pname = "SteadyHeat_k" + std::to_string((int)k_val);
-                    run_case(pname, *mesh, ref, mc,
+                    run_case(pname, *mesh, ref, mc, mt_label,
                         [&](FiniteElementSpace& fes, HeatResult& r){
                             return BuildSteadyHeat(*mesh, fes, k_val, r);
                         });
@@ -1079,7 +1290,7 @@ int main(int argc, char** argv)
                 for (auto [kx, ky, kz] : cases) {
                     std::string pname = "AnisoHeat_"+std::to_string((int)kx)
                                          + "_" + std::to_string((int)ky);
-                    run_case(pname, *mesh, ref, mc,
+                    run_case(pname, *mesh, ref, mc, mt_label,
                         [&](FiniteElementSpace& fes, HeatResult& r){
                             return BuildAnisoHeat(*mesh, fes, kx, ky, kz, r);
                         });
@@ -1091,7 +1302,7 @@ int main(int argc, char** argv)
                 for (double c : {10.0, 50.0, 100.0, 500.0, 1000.0, 1e6}) {
                     std::ostringstream oss;
                     oss << "MultiMat_c1e" << (int)std::log10(c);
-                    run_case(oss.str(), *mesh, ref, mc,
+                    run_case(oss.str(), *mesh, ref, mc, mt_label,
                         [&](FiniteElementSpace& fes, HeatResult& r){
                             return BuildMultiMatHeat(*mesh, fes, c, r);
                         });
@@ -1114,7 +1325,7 @@ int main(int argc, char** argv)
                 for (double hc : {0.1, 1.0, 10.0, 50.0, 100.0, 500.0 ,1000.0}) {
                     std::ostringstream oss;
                     oss << "RobinHeat_h" << (int)hc;
-                    run_case(oss.str(), *mesh, ref, mc,
+                    run_case(oss.str(), *mesh, ref, mc, mt_label,
                         [&](FiniteElementSpace& fes, HeatResult& r){
                             return BuildRobinHeat(*mesh, fes, hc, r);
                         });
@@ -1127,7 +1338,7 @@ int main(int argc, char** argv)
                     std::ostringstream oss;
                     oss << "Transient_dt" << std::scientific
                         << std::setprecision(0) << dt;
-                    run_case(oss.str(), *mesh, ref, mc,
+                    run_case(oss.str(), *mesh, ref, mc, mt_label,
                         [&](FiniteElementSpace& fes, HeatResult& r){
                             return BuildTransientStep(*mesh, fes, dt, r);
                         });
@@ -1140,7 +1351,7 @@ int main(int argc, char** argv)
                     std::ostringstream oss;
                     oss << "Nonlinear_a" << std::fixed
                         << std::setprecision(1) << alpha;
-                    run_case(oss.str(), *mesh, ref, mc,
+                    run_case(oss.str(), *mesh, ref, mc, mt_label,
                         [&](FiniteElementSpace& fes, HeatResult& r){
                             return BuildNonlinearStep(*mesh, fes, alpha, r);
                         });

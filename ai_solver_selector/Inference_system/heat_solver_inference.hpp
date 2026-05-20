@@ -326,6 +326,15 @@ public:
 
     /**
      * @brief 根据求解器名称创建配置好的 MFEM Solver，并求解 A x = b
+     *
+     * 支持的求解器（必须与 collect_heat_data.cpp::GetSolverList 对齐）：
+     *   - CG / PCG_Jacobi / PCG_l1Jac / PCG_GS / PCG_Cheby
+     *   - MINRES / MINRES_Jac
+     *   - GMRES / GMRES_Jac / GMRES_GS
+     *   - FGMRES_Jac / FGMRES_GS
+     *   - BiCGSTAB / BiCGSTAB_Jac / BiCGSTAB_GS
+     *   - SLI_Jac (可选)
+     *   - DIRECT_UMF (若编译开启 SuiteSparse)
      */
     HeatSolveResult Solve(const std::string& solver_name,
                            mfem::SparseMatrix& A,
@@ -341,30 +350,43 @@ public:
         HeatSolveResult r;
         r.solver_used = solver_name;
 
+        // ── 解析名字尾部的前提条件子后缀 ───────────────────────
+        // "PCG_Jacobi" → "Jacobi" ；"GMRES" → "" ； "BiCGSTAB_GS" → "GS"
+        std::string prec_suffix;
+        {
+            auto p = solver_name.find('_');
+            if (p != std::string::npos) prec_suffix = solver_name.substr(p + 1);
+        }
+
         std::unique_ptr<mfem::Solver> prec;
         auto t_setup = Clock::now();
 
         // 预条件器
-        if (solver_name == "PCG_GS" || solver_name == "GMRES_GS") {
-            prec.reset(new mfem::GSSmoother(A));
-        } else if (solver_name == "PCG_Jacobi" || solver_name == "MINRES_Jac"
-                   || solver_name == "GMRES_Jac") {
-            prec.reset(new mfem::DSmoother(A, 0));
-        } else if (solver_name == "PCG_Cheby") {
-            prec.reset(new mfem::DSmoother(A, 2, 10));
-        }
+        if      (prec_suffix == "GS")       prec.reset(new mfem::GSSmoother(A));
+        else if (prec_suffix == "Jacobi" ||
+                 prec_suffix == "Jac")      prec.reset(new mfem::DSmoother(A, 0));
+        else if (prec_suffix == "l1Jac")    prec.reset(new mfem::DSmoother(A, 1));
+        else if (prec_suffix == "Cheby")    prec.reset(new mfem::DSmoother(A, 2, 10));
         r.setup_ms = ms_since(t_setup);
 
-        // 迭代求解器
+        // 迭代求解器（FGMRES 必须先于 GMRES 匹配）
         std::unique_ptr<mfem::IterativeSolver> solver;
         if (solver_name == "CG" || solver_name.substr(0, 3) == "PCG") {
             solver.reset(new mfem::CGSolver());
         } else if (solver_name.substr(0, 6) == "MINRES") {
             solver.reset(new mfem::MINRESSolver());
+        } else if (solver_name.substr(0, 6) == "FGMRES") {
+            auto* fg = new mfem::FGMRESSolver();
+            fg->SetKDim(30);
+            solver.reset(fg);
         } else if (solver_name.substr(0, 5) == "GMRES") {
             auto* gm = new mfem::GMRESSolver();
             gm->SetKDim(30);
             solver.reset(gm);
+        } else if (solver_name.substr(0, 8) == "BiCGSTAB") {
+            solver.reset(new mfem::BiCGSTABSolver());
+        } else if (solver_name.substr(0, 3) == "SLI") {
+            solver.reset(new mfem::SLISolver());
         }
 #ifdef MFEM_USE_SUITESPARSE
         else if (solver_name == "DIRECT_UMF") {

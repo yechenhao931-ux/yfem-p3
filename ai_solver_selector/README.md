@@ -225,6 +225,32 @@ The demo prints the model's predicted runtime per solver, runs the chosen
 one, and then re-runs all six to confirm whether the AI matched the true
 optimum.
 
+## Using real meshes from `mfem/data`
+
+The data collector can now pull `.mesh` files from a directory in addition to
+generating Cartesian grids. See `CHANGES_v3.md` for the full design. Quick
+recipe:
+
+```bash
+./ai_collect_heat_data \
+    --mesh-dir /home/user/yfem-p3/data \
+    --mesh-max-ref 3 \
+    --max-dof 200000 \
+    --output ../../data/heat_results_v3.csv
+```
+
+NURBS / periodic / surface / 1-D meshes are automatically filtered out. Mixed
+meshes (e.g. `square-mixed.mesh`, `fichera-mixed.mesh`) are tagged
+`mesh_type=MIXED` and `pandas.get_dummies` handles the new one-hot column
+without any change to the trainer.
+
+The serial solver registry now contains 14 Krylov pairs (CG, PCG_Jacobi,
+PCG_l1Jac, PCG_GS, MINRES, MINRES_Jac, GMRES, GMRES_Jac, GMRES_GS, FGMRES_Jac,
+FGMRES_GS, BiCGSTAB, BiCGSTAB_Jac, BiCGSTAB_GS) plus the optional UMFPACK
+direct solver. The inference module (`heat_solver_inference.hpp::Solve`) knows
+how to instantiate each one — names are parsed by `prefix_solver_suffix`, so
+adding `FGMRES_l1Jac` later only needs an entry in `GetSolverList`.
+
 ## Adding new heat-conduction problem types or solvers
 
 1. Append a new entry to `enum SolverId` and `MakeSolver` in
